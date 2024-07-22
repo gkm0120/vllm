@@ -1,4 +1,6 @@
+import argparse
 import asyncio
+import contextlib
 import datetime
 import enum
 import gc
@@ -14,10 +16,11 @@ from collections import defaultdict
 from functools import lru_cache, partial, wraps
 from platform import uname
 from typing import (Any, AsyncIterator, Awaitable, Callable, Dict, Generic,
-                    Hashable, List, Optional, OrderedDict, Tuple, TypeVar,
+                    Hashable, List, Optional, OrderedDict, Set, Tuple, TypeVar,
                     Union)
 
 import numpy as np
+import numpy.typing as npt
 import psutil
 import torch
 import torch.types
@@ -38,9 +41,25 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e5m2": torch.uint8,
 }
 
+TORCH_DTYPE_TO_NUMPY_DTYPE = {
+    torch.float16: np.float16,
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.uint8: np.uint8,
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+}
+
 P = ParamSpec('P')
 K = TypeVar("K")
 T = TypeVar("T")
+
+
+class _Sentinel:
+    ...
+
+
+ALL_PINNED_SENTINEL = _Sentinel()
 
 
 class Device(enum.Enum):
@@ -66,6 +85,7 @@ class LRUCache(Generic[T]):
 
     def __init__(self, capacity: int):
         self.cache: OrderedDict[Hashable, T] = OrderedDict()
+        self.pinned_items: Set[Hashable] = set()
         self.capacity = capacity
 
     def __contains__(self, key: Hashable) -> bool:
@@ -101,14 +121,36 @@ class LRUCache(Generic[T]):
         self.cache.move_to_end(key)
         self._remove_old_if_needed()
 
+    def pin(self, key: Hashable) -> None:
+        """
+        Pins a key in the cache preventing it from being
+        evicted in the LRU order.
+        """
+        if key not in self.cache:
+            raise ValueError(f"Cannot pin key: {key} not in cache.")
+        self.pinned_items.add(key)
+
+    def _unpin(self, key: Hashable) -> None:
+        self.pinned_items.remove(key)
+
     def _on_remove(self, key: Hashable, value: Optional[T]):
         pass
 
-    def remove_oldest(self):
+    def remove_oldest(self, remove_pinned=False):
         if not self.cache:
             return
-        key, value = self.cache.popitem(last=False)
-        self._on_remove(key, value)
+
+        if not remove_pinned:
+            # pop the oldest item in the cache that is not pinned
+            lru_key = next(
+                (key for key in self.cache if key not in self.pinned_items),
+                ALL_PINNED_SENTINEL)
+            if lru_key is ALL_PINNED_SENTINEL:
+                raise RuntimeError("All items are pinned, "
+                                   "cannot remove oldest from the cache.")
+        else:
+            lru_key = next(iter(self.cache))
+        self.pop(lru_key)
 
     def _remove_old_if_needed(self) -> None:
         while len(self.cache) > self.capacity:
@@ -119,13 +161,16 @@ class LRUCache(Generic[T]):
             default_value: Optional[T] = None) -> Optional[T]:
         run_on_remove = key in self.cache
         value: Optional[T] = self.cache.pop(key, default_value)
+        # remove from pinned items
+        if key in self.pinned_items:
+            self._unpin(key)
         if run_on_remove:
             self._on_remove(key, value)
         return value
 
     def clear(self):
         while len(self.cache) > 0:
-            self.remove_oldest()
+            self.remove_oldest(remove_pinned=True)
         self.cache.clear()
 
 
@@ -138,6 +183,15 @@ def is_cpu() -> bool:
     from importlib.metadata import PackageNotFoundError, version
     try:
         return "cpu" in version("vllm")
+    except PackageNotFoundError:
+        return False
+
+
+@lru_cache(maxsize=None)
+def is_openvino() -> bool:
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return "openvino" in version("vllm")
     except PackageNotFoundError:
         return False
 
@@ -350,9 +404,31 @@ def update_environment_variables(envs: Dict[str, str]):
         os.environ[k] = v
 
 
-def chunk_list(lst: List[T], chunk_size: int) -> List[List[T]]:
+def init_kmp_env():
+    if not is_cpu():
+        return
+
+    ld_prealod_str = os.getenv("LD_PRELOAD", "")
+    if "libiomp5.so" not in ld_prealod_str:
+        return
+
+    # The time(milliseconds) that a thread should wait after completing the
+    # execution of a parallel region, before sleeping.
+    os.environ['KMP_BLOCKTIME'] = "1"
+    # dump settings on start up
+    os.environ['KMP_SETTINGS'] = "1"
+    # Prevents the CPU to run into low performance state
+    os.environ['KMP_TPAUSE'] = "0"
+    # Provides fine granularity parallelism
+    os.environ['KMP_FORKJOIN_BARRIER_PATTERN'] = "dist,dist"
+    os.environ['KMP_PLAIN_BARRIER_PATTERN'] = "dist,dist"
+    os.environ['KMP_REDUCTION_BARRIER_PATTERN'] = "dist,dist"
+
+
+def chunk_list(lst: List[T], chunk_size: int):
     """Yield successive chunk_size chunks from lst."""
-    return [lst[i:i + chunk_size] for i in range(0, len(lst), chunk_size)]
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i:i + chunk_size]
 
 
 def cdiv(a: int, b: int) -> int:
@@ -508,7 +584,7 @@ def is_pin_memory_available() -> bool:
     elif is_neuron():
         print_warning_once("Pin memory is not supported on Neuron.")
         return False
-    elif is_cpu():
+    elif is_cpu() or is_openvino():
         return False
     return True
 
@@ -551,23 +627,54 @@ def str_to_int_tuple(s: str) -> Tuple[int, ...]:
             f"(e.g., 1, 2, 3). Given input: {s}") from e
 
 
-def make_tensor_with_pad(
-    x: List[List[int]],
-    max_len: int,
-    pad: int,
-    dtype: torch.dtype,
-    device: Optional[Union[str, torch.device]],
-) -> torch.Tensor:
-    """Make a padded tensor of a 2D inputs.
+def make_ndarray_with_pad(
+    x: List[List[T]],
+    pad: T,
+    dtype: npt.DTypeLike,
+    *,
+    max_len: Optional[int] = None,
+) -> npt.NDArray:
+    """
+    Make a padded array from 2D inputs.
 
     The padding is applied to the end of each inner list until it reaches
     `max_len`.
     """
-    padded_x = np.zeros([len(x), max_len], dtype=np.int32) + pad
+    if max_len is None:
+        # Unlike for most functions, map is faster than a genexpr over `len`
+        max_len = max(map(len, x), default=0)
+
+    padded_x = np.full((len(x), max_len), pad, dtype=dtype)
     for ind, blocktb in enumerate(x):
         assert len(blocktb) <= max_len
         padded_x[ind, :len(blocktb)] = blocktb
-    return torch.tensor(padded_x, dtype=dtype, device=device)
+
+    return padded_x
+
+
+def make_tensor_with_pad(
+    x: List[List[T]],
+    pad: T,
+    dtype: torch.dtype,
+    *,
+    max_len: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    pin_memory: bool = False,
+) -> torch.Tensor:
+    """
+    Make a padded tensor from 2D inputs.
+
+    The padding is applied to the end of each inner list until it reaches
+    `max_len`.
+    """
+    np_dtype = TORCH_DTYPE_TO_NUMPY_DTYPE[dtype]
+    padded_x = make_ndarray_with_pad(x, pad, np_dtype, max_len=max_len)
+
+    tensor = torch.from_numpy(padded_x).to(device)
+    if pin_memory:
+        tensor = tensor.pin_memory()
+
+    return tensor
 
 
 def async_tensor_h2d(
@@ -745,9 +852,14 @@ def _cuda_device_count_stateless(
 
     if not torch.cuda._is_compiled():
         return 0
-    # bypass _device_count_nvml() if rocm (not supported)
-    nvml_count = -1 if torch.version.hip else torch.cuda._device_count_nvml()
-    r = torch._C._cuda_getDeviceCount() if nvml_count < 0 else nvml_count
+    if is_hip():
+        # ROCm uses amdsmi instead of nvml for stateless device count
+        # This requires a sufficiently modern version of Torch 2.4.0
+        raw_count = torch.cuda._device_count_amdsmi() if (hasattr(
+            torch.cuda, "_device_count_amdsmi")) else -1
+    else:
+        raw_count = torch.cuda._device_count_nvml()
+    r = torch._C._cuda_getDeviceCount() if raw_count < 0 else raw_count
     return r
 
 
@@ -761,8 +873,78 @@ def cuda_device_count_stateless() -> int:
 
     # This can be removed and simply replaced with torch.cuda.get_device_count
     # after https://github.com/pytorch/pytorch/pull/122815 is released.
-
     return _cuda_device_count_stateless(envs.CUDA_VISIBLE_DEVICES)
+
+
+def error_on_invalid_device_count_status():
+    cache_entries = 0
+    with contextlib.suppress(Exception):
+        # future pytorch will fix the issue, device_count will not be cached
+        # at that time, `.cache_info().currsize` will error out
+        cache_entries = torch.cuda.device_count.cache_info().currsize
+    if cache_entries != 0:
+        # the function is already called, and the result is cached
+        remembered = torch.cuda.device_count()
+        current = cuda_device_count_stateless()
+        if remembered > current:
+            raise RuntimeError(
+                "The number of CUDA devices has changed since the first "
+                "call to torch.cuda.device_count(). This is not allowed "
+                "and may result in undefined behavior. Please check out "
+                "https://github.com/vllm-project/vllm/issues/6056 to "
+                "find the first call to torch.cuda.device_count() "
+                "and defer it until the engine is up. Or you can set "
+                "CUDA_VISIBLE_DEVICES to the GPUs you want to use.")
+
+
+# NVML utils
+# Note that NVML is not affected by `CUDA_VISIBLE_DEVICES`,
+# all the related functions work on real physical device ids.
+# the major benefit of using NVML is that it will not initialize CUDA
+
+try:
+    import pynvml
+except ImportError:
+    # For non-NV devices
+    pynvml = None
+
+
+def with_nvml_context(fn):
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if pynvml is not None:
+            pynvml.nvmlInit()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if pynvml is not None:
+                pynvml.nvmlShutdown()
+
+    return wrapper
+
+
+@with_nvml_context
+def is_full_nvlink(device_ids: List[int]) -> bool:
+    """
+    query if the set of gpus are fully connected by nvlink (1 hop)
+    """
+    handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in device_ids]
+    for i, handle in enumerate(handles):
+        for j, peer_handle in enumerate(handles):
+            if i < j:
+                try:
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK)
+                    if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                        return False
+                except pynvml.NVMLError as error:
+                    logger.error(
+                        "NVLink detection failed. This is normal if your"
+                        " machine has no NVLink equipped.",
+                        exc_info=error)
+                    return False
+    return True
 
 
 #From: https://stackoverflow.com/a/4104188/2749989
@@ -775,3 +957,34 @@ def run_once(f):
 
     wrapper.has_run = False  # type: ignore[attr-defined]
     return wrapper
+
+
+class FlexibleArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that allows both underscore and dash in names."""
+
+    def parse_args(self, args=None, namespace=None):
+        if args is None:
+            args = sys.argv[1:]
+
+        # Convert underscores to dashes and vice versa in argument names
+        processed_args = []
+        for arg in args:
+            if arg.startswith('--'):
+                if '=' in arg:
+                    key, value = arg.split('=', 1)
+                    key = '--' + key[len('--'):].replace('_', '-')
+                    processed_args.append(f'{key}={value}')
+                else:
+                    processed_args.append('--' +
+                                          arg[len('--'):].replace('_', '-'))
+            else:
+                processed_args.append(arg)
+
+        return super().parse_args(processed_args, namespace)
+
+
+async def _run_task_with_lock(task: Callable, lock: asyncio.Lock, *args,
+                              **kwargs):
+    """Utility function to run async task in a lock"""
+    async with lock:
+        return await task(*args, **kwargs)

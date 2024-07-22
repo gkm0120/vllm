@@ -56,7 +56,7 @@ First, install the dependencies:
     $ pip uninstall torch torch-xla -y
 
     $ # Install PyTorch and PyTorch XLA.
-    $ export DATE="+20240601"
+    $ export DATE="+20240713"
     $ pip install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch-nightly${DATE}-cp310-cp310-linux_x86_64.whl
     $ pip install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-nightly${DATE}-cp310-cp310-linux_x86_64.whl
 
@@ -73,3 +73,21 @@ Next, build vLLM from source. This will only take a few seconds:
 .. code-block:: console
 
     $ VLLM_TARGET_DEVICE="tpu" python setup.py develop
+
+
+.. tip::
+
+    If you encounter the following error:
+
+    .. code-block:: console
+
+        from torch._C import *  # noqa: F403
+        ImportError: libopenblas.so.0: cannot open shared object file: No such file or directory
+
+
+    Please install OpenBLAS with the following command:
+
+    .. code-block:: console
+
+        $ sudo apt-get install libopenblas-base libopenmpi-dev libomp-dev
+

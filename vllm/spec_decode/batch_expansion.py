@@ -4,11 +4,11 @@ from typing import Iterator, List, Tuple
 import torch
 
 from vllm.sequence import (ExecuteModelRequest, SamplerOutput, SequenceData,
-                           SequenceGroupMetadata)
+                           SequenceGroupMetadata, SequenceGroupState,
+                           get_all_seq_ids)
 from vllm.spec_decode.interfaces import (SpeculativeProposals,
                                          SpeculativeScorer, SpeculativeScores)
-from vllm.spec_decode.util import (get_all_seq_ids, nvtx_range,
-                                   sampler_output_to_torch,
+from vllm.spec_decode.util import (nvtx_range, sampler_output_to_torch,
                                    split_batch_by_proposal_len)
 from vllm.worker.worker_base import WorkerBase
 
@@ -98,6 +98,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
             probs=all_probs,
             token_ids=all_tokens,
             logprobs=spec_logprobs,
+            hidden_states=target_sampler_output.hidden_states,
         )
 
     def _expand_batch(
@@ -292,6 +293,15 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         for data in new_seq_data_dict.values():
             data.update_num_computed_tokens(data.get_len() - 1)
 
+        if (seq_group_metadata.state is not None
+                and seq_group_metadata.state.generator is not None):
+            generator = torch.Generator(
+                device=seq_group_metadata.state.generator.device)
+            generator.set_state(seq_group_metadata.state.generator.get_state())
+            state = SequenceGroupState(generator=generator)
+        else:
+            state = None
+
         return SequenceGroupMetadata(
             request_id=seq_group_metadata.request_id,
             is_prompt=seq_group_metadata.is_prompt,
@@ -302,6 +312,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
             },
             lora_request=None,
             token_chunk_size=1,
+            state=state,
         )
 
     def _split_scoring_output(

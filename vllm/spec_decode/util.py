@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -8,14 +8,6 @@ from vllm.sequence import (CompletionSequenceGroupOutput, Logprob,
                            SequenceOutput)
 
 SeqId = int
-
-
-def get_all_seq_ids(
-        seq_group_metadata_list: List[SequenceGroupMetadata]) -> List[SeqId]:
-    """Given a list of SequenceGroupMetadata, create a list of all
-    sequence ids.
-    """
-    return [seq_id for sg in seq_group_metadata_list for seq_id in sg.seq_data]
 
 
 def get_all_num_logprobs(
@@ -61,8 +53,8 @@ def create_sequence_group_output(
     token_id_logprob_rank: int,
     token_id_logprob: float,
     seq_id: SeqId,
-    topk_token_ids: List[int],
-    topk_logprobs: List[float],
+    topk_token_ids: List[Optional[int]],
+    topk_logprobs: List[Optional[float]],
 ) -> CompletionSequenceGroupOutput:
     """Create a SequenceGroupOutput given the sampling results.
 
@@ -76,7 +68,7 @@ def create_sequence_group_output(
     """
     # vLLM logprobs always include the sampled token. In addition, the user may
     # request topk-logprobs (where top-k varies per user up to max_logprobs).
-    logprobs: Dict[int, Logprob] = {
+    logprobs: Dict[Optional[int], Logprob] = {
         token_id: Logprob(
             logprob=token_id_logprob,
             rank=token_id_logprob_rank,

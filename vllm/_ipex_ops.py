@@ -43,6 +43,9 @@ class ipex_ops:
     def gelu_new(out: torch.Tensor, x: torch.Tensor) -> None:
         out.copy_(torch.nn.functional.gelu(x))
 
+    # TODO add implementation of gelu_quick here
+    # def gelu_quick(out: torch.Tensor, x: torch.Tensor) -> None:
+
     def paged_attention_v1(
         out: torch.Tensor,
         query: torch.Tensor,
@@ -56,7 +59,8 @@ class ipex_ops:
         max_context_len: int,
         alibi_slopes: Optional[torch.Tensor],
         kv_cache_dtype: str,
-        kv_scale: float,
+        k_scale: float,
+        v_scale: float,
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,
@@ -96,7 +100,8 @@ class ipex_ops:
         max_context_len: int,
         alibi_slopes: Optional[torch.Tensor],
         kv_cache_dtype: str,
-        kv_scale: float,
+        k_scale: float,
+        v_scale: float,
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,
@@ -224,7 +229,8 @@ class ipex_ops:
         value_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
-        kv_scale: float,
+        k_scale: float,
+        v_scale: float,
     ) -> None:
         assert kv_cache_dtype == "auto"
         ipex.llm.modules.PagedAttention.reshape_and_cache(

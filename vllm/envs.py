@@ -5,6 +5,7 @@ if TYPE_CHECKING:
     VLLM_HOST_IP: str = ""
     VLLM_PORT: Optional[int] = None
     VLLM_USE_MODELSCOPE: bool = False
+    VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_INSTANCE_ID: Optional[str] = None
     VLLM_NCCL_SO_PATH: Optional[str] = None
     LD_LIBRARY_PATH: Optional[str] = None
@@ -16,7 +17,8 @@ if TYPE_CHECKING:
     S3_ACCESS_KEY_ID: Optional[str] = None
     S3_SECRET_ACCESS_KEY: Optional[str] = None
     S3_ENDPOINT_URL: Optional[str] = None
-    VLLM_CONFIG_ROOT: str = ""
+    VLLM_CACHE_ROOT: str = os.path.expanduser("~/.cache/vllm")
+    VLLM_CONFIG_ROOT: str = os.path.expanduser("~/.config/vllm")
     VLLM_USAGE_STATS_SERVER: str = "https://stats.vllm.ai"
     VLLM_NO_USAGE_STATS: bool = False
     VLLM_DO_NOT_TRACK: bool = False
@@ -27,17 +29,39 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: Optional[str] = None
     VLLM_CPU_KVCACHE_SPACE: int = 0
-    VLLM_XLA_CACHE_PATH: str = "~/.vllm/xla_cache/"
+    VLLM_OPENVINO_KVCACHE_SPACE: int = 0
+    VLLM_OPENVINO_CPU_KV_CACHE_PRECISION: Optional[str] = None
+    VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS: bool = False
+    VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
+    VLLM_FUSED_MOE_CHUNK_SIZE: int = 64 * 1024
+    VLLM_USE_RAY_SPMD_WORKER: bool = False
     VLLM_USE_RAY_COMPILED_DAG: bool = False
-    VLLM_WORKER_MULTIPROC_METHOD: str = "spawn"
+    VLLM_WORKER_MULTIPROC_METHOD: str = "fork"
+    VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
     VLLM_IMAGE_FETCH_TIMEOUT: int = 5
     VLLM_TARGET_DEVICE: str = "cuda"
     MAX_JOBS: Optional[str] = None
     NVCC_THREADS: Optional[str] = None
     VLLM_USE_PRECOMPILED: bool = False
     VLLM_INSTALL_PUNICA_KERNELS: bool = False
+    VLLM_NO_DEPRECATION_WARNING: bool = False
     CMAKE_BUILD_TYPE: Optional[str] = None
     VERBOSE: bool = False
+
+
+def get_default_cache_root():
+    return os.getenv(
+        "XDG_CACHE_HOME",
+        os.path.join(os.path.expanduser("~"), ".cache"),
+    )
+
+
+def get_default_config_root():
+    return os.getenv(
+        "XDG_CONFIG_HOME",
+        os.path.join(os.path.expanduser("~"), ".config"),
+    )
+
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -48,7 +72,8 @@ environment_variables: Dict[str, Callable[[], Any]] = {
 
     # ================== Installation Time Env Vars ==================
 
-    # Target device of vLLM, supporting [cuda (by default), rocm, neuron, cpu]
+    # Target device of vLLM, supporting [cuda (by default),
+    # rocm, neuron, cpu, openvino]
     "VLLM_TARGET_DEVICE":
     lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda"),
 
@@ -82,14 +107,27 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv('VERBOSE', '0'))),
 
     # Root directory for VLLM configuration files
+    # Defaults to `~/.config/vllm` unless `XDG_CONFIG_HOME` is set
     # Note that this not only affects how vllm finds its configuration files
     # during runtime, but also affects how vllm installs its configuration
     # files during **installation**.
     "VLLM_CONFIG_ROOT":
-    lambda: os.environ.get("VLLM_CONFIG_ROOT", None) or os.getenv(
-        "XDG_CONFIG_HOME", None) or os.path.expanduser("~/.config"),
+    lambda: os.path.expanduser(
+        os.getenv(
+            "VLLM_CONFIG_ROOT",
+            os.path.join(get_default_config_root(), "vllm"),
+        )),
 
     # ================== Runtime Env Vars ==================
+
+    # Root directory for VLLM cache files
+    # Defaults to `~/.cache/vllm` unless `XDG_CACHE_HOME` is set
+    "VLLM_CACHE_ROOT":
+    lambda: os.path.expanduser(
+        os.getenv(
+            "VLLM_CACHE_ROOT",
+            os.path.join(get_default_cache_root(), "vllm"),
+        )),
 
     # used in distributed environment to determine the master address
     'VLLM_HOST_IP':
@@ -113,6 +151,10 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # instance should have the same instance id.
     "VLLM_INSTANCE_ID":
     lambda: os.environ.get("VLLM_INSTANCE_ID", None),
+
+    # Interval in seconds to log a warning message when the ring buffer is full
+    "VLLM_RINGBUFFER_WARNING_INTERVAL":
+    lambda: int(os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")),
 
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
@@ -195,6 +237,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # - "FLASH_ATTN": use FlashAttention
     # - "XFORMERS": use XFormers
     # - "ROCM_FLASH": use ROCmFlashAttention
+    # - "FLASHINFER": use flashinfer
     "VLLM_ATTENTION_BACKEND":
     lambda: os.getenv("VLLM_ATTENTION_BACKEND", None),
 
@@ -202,6 +245,29 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # default is 4GB
     "VLLM_CPU_KVCACHE_SPACE":
     lambda: int(os.getenv("VLLM_CPU_KVCACHE_SPACE", "0")),
+
+    # OpenVINO key-value cache space
+    # default is 4GB
+    "VLLM_OPENVINO_KVCACHE_SPACE":
+    lambda: int(os.getenv("VLLM_OPENVINO_KVCACHE_SPACE", "0")),
+
+    # OpenVINO KV cache precision
+    # default is bf16 if natively supported by platform, otherwise f16
+    # To enable KV cache compression, please, explicitly specify u8
+    "VLLM_OPENVINO_CPU_KV_CACHE_PRECISION":
+    lambda: os.getenv("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION", None),
+
+    # Enables weights compression during model export via HF Optimum
+    # default is False
+    "VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS":
+    lambda: bool(os.getenv("VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS", False)),
+
+    # If the env var is set, then all workers will execute as separate
+    # processes from the engine, and we use the same mechanism to trigger
+    # execution on all workers.
+    # Run vLLM with VLLM_USE_RAY_SPMD_WORKER=1 to enable it.
+    "VLLM_USE_RAY_SPMD_WORKER":
+    lambda: bool(os.getenv("VLLM_USE_RAY_SPMD_WORKER", 0)),
 
     # If the env var is set, it uses the Ray's compiled DAG API
     # which optimizes the control plane overhead.
@@ -212,7 +278,15 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
     "VLLM_WORKER_MULTIPROC_METHOD":
-    lambda: os.getenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn"),
+    lambda: os.getenv("VLLM_WORKER_MULTIPROC_METHOD", "fork"),
+
+    # Path to the cache for storing downloaded assets
+    "VLLM_ASSETS_CACHE":
+    lambda: os.path.expanduser(
+        os.getenv(
+            "VLLM_ASSETS_CACHE",
+            os.path.join(get_default_cache_root(), "vllm", "assets"),
+        )),
 
     # Timeout for fetching images when serving multimodal models
     # Default is 5 seconds
@@ -222,13 +296,23 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # Path to the XLA persistent cache directory.
     # Only used for XLA devices such as TPUs.
     "VLLM_XLA_CACHE_PATH":
-    lambda: os.getenv("VLLM_XLA_CACHE_PATH", "~/.vllm/xla_cache/"),
+    lambda: os.path.expanduser(
+        os.getenv(
+            "VLLM_ASSETS_CACHE",
+            os.path.join(get_default_cache_root(), "vllm", "xla_cache"),
+        )),
+    "VLLM_FUSED_MOE_CHUNK_SIZE":
+    lambda: int(os.getenv("VLLM_FUSED_MOE_CHUNK_SIZE", "65536")),
+
+    # If set, vllm will skip the deprecation warnings.
+    "VLLM_NO_DEPRECATION_WARNING":
+    lambda: bool(int(os.getenv("VLLM_NO_DEPRECATION_WARNING", "0"))),
 }
 
 # end-env-vars-definition
 
 
-def __getattr__(name):
+def __getattr__(name: str):
     # lazy evaluation of environment variables
     if name in environment_variables:
         return environment_variables[name]()
