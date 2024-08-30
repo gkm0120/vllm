@@ -11,7 +11,7 @@ pytest-shard
 
 # testing utils
 awscli
-einops # required for MPT and qwen-vl
+einops # required for MPT, qwen-vl and Mamba
 httpx
 peft
 requests
@@ -30,3 +30,4 @@ aiohttp
 
 # quantization
 bitsandbytes==0.42.0
+buildkite-test-collector==0.1.8
