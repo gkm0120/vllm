@@ -33,10 +33,8 @@ def is_block_tables_empty(block_tables: Union[None, Dict]):
     """
     if block_tables is None:
         return True
-    if isinstance(block_tables, dict) and all(
-            value is None for value in block_tables.values()):
-        return True
-    return False
+    return (isinstance(block_tables, dict)
+            and all(value is None for value in block_tables.values()))
 
 
 def compute_slot_mapping_start_idx(is_prompt: bool, query_len: int,
@@ -314,7 +312,8 @@ class CommonAttentionState(AttentionState):
             slot_mapping=self._graph_slot_mapping[:batch_size],
             seq_lens=None,
             seq_lens_tensor=self._graph_seq_lens[:batch_size],
-            max_query_len=None,
+            max_query_len=1,
+            decode_query_len=1,
             max_prefill_seq_len=0,
             max_decode_seq_len=self.runner.max_seq_len_to_capture,
             query_start_loc=None,
