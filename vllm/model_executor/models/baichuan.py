@@ -253,13 +253,18 @@ class BaiChuanDecoderLayer(nn.Module):
 @support_torch_compile
 class BaiChuanModel(nn.Module):
 
-    def __init__(self,
-                 config: PretrainedConfig,
-                 position_embedding: str,
-                 cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        position_embedding: str = "ROPE",
+    ) -> None:
         super().__init__()
+
+        config = vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
+
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -279,6 +284,9 @@ class BaiChuanModel(nn.Module):
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
 
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -286,9 +294,13 @@ class BaiChuanModel(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -332,21 +344,22 @@ class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def __init__(
         self,
+        *,
         vllm_config: VllmConfig,
         prefix: str = "",
         position_embedding: str = "ROPE",
     ):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config
         self.config = config
         self.lora_config = lora_config
 
         self.quant_config = quant_config
-        self.model = BaiChuanModel(config, position_embedding, cache_config,
-                                   quant_config)
+        self.model = BaiChuanModel(vllm_config=vllm_config,
+                                   prefix=prefix,
+                                   position_embedding=position_embedding)
         self.lm_head = ParallelLMHead(config.vocab_size,
                                       config.hidden_size,
                                       quant_config=quant_config)
@@ -357,6 +370,9 @@ class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -364,9 +380,11 @@ class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors)
+                                   attn_metadata, intermediate_tensors,
+                                   inputs_embeds)
         return hidden_states
 
     def compute_logits(
@@ -438,16 +456,16 @@ class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
     NOTE: the class name has a lower case 'c'.
     """
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-    ):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_config
         if config.hidden_size == 4096:  # baichuan2 7b
-            super().__init__(vllm_config, prefix, "ROPE")
+            super().__init__(vllm_config=vllm_config,
+                             prefix=prefix,
+                             position_embedding="ROPE")
         else:  # baichuan 13b, baichuan2 13b
-            super().__init__(vllm_config, prefix, "ALIBI")
+            super().__init__(vllm_config=vllm_config,
+                             prefix=prefix,
+                             position_embedding="ALIBI")
 
 
 class BaiChuanForCausalLM(BaiChuanBaseForCausalLM):
@@ -455,9 +473,7 @@ class BaiChuanForCausalLM(BaiChuanBaseForCausalLM):
     NOTE: the class name has an upper case 'C'.
     """
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-    ):
-        super().__init__(vllm_config, prefix, "ROPE")
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config,
+                         prefix=prefix,
+                         position_embedding="ROPE")
