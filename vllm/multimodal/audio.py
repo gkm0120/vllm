@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import base64
 from io import BytesIO
 from pathlib import Path
@@ -9,7 +11,7 @@ from vllm.inputs.registry import InputContext
 from vllm.utils import PlaceholderModule
 
 from .base import MediaIO, MultiModalPlugin
-from .inputs import AudioItem, MultiModalData, MultiModalKwargs
+from .inputs import AudioItem, ModalityData, MultiModalKwargs
 
 try:
     import librosa
@@ -31,7 +33,7 @@ class AudioPlugin(MultiModalPlugin):
     def _default_input_mapper(
         self,
         ctx: InputContext,
-        data: MultiModalData[AudioItem],
+        data: ModalityData[AudioItem],
         **mm_processor_kwargs,
     ) -> MultiModalKwargs:
         raise NotImplementedError("There is no default audio input mapper")

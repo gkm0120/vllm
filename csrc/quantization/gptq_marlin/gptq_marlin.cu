@@ -173,8 +173,8 @@ dequant<half, vllm::kU4B8.id()>(int q) {
   const int HI = 0x00f000f0;
   const int EX = 0x64006400;
   // Guarantee that the `(a & b) | c` operations are LOP3s.
-  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
-  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  int lo = lop3 < (0xf0 & 0xcc) | 0xaa > (q, LO, EX);
+  int hi = lop3 < (0xf0 & 0xcc) | 0xaa > (q, HI, EX);
   // We want signed int4 outputs, hence we fuse the `-8` symmetric zero point
   // directly into `SUB` and `ADD`.
   const int SUB = 0x64086408;
@@ -197,9 +197,9 @@ dequant<nv_bfloat16, vllm::kU4B8.id()>(int q) {
 
   // Guarantee that the `(a & b) | c` operations are LOP3s.
 
-  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  int lo = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
   q >>= 4;
-  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  int hi = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
 
   typename ScalarType<nv_bfloat16>::FragB frag_b;
   static constexpr uint32_t MUL = 0x3F803F80;
@@ -221,8 +221,8 @@ dequant<half, vllm::kU4.id()>(int q) {
   const int HI = 0x00f000f0;
   const int EX = 0x64006400;
   // Guarantee that the `(a & b) | c` operations are LOP3s.
-  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
-  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  int lo = lop3 < (0xf0 & 0xcc) | 0xaa > (q, LO, EX);
+  int hi = lop3 < (0xf0 & 0xcc) | 0xaa > (q, HI, EX);
 
   const int SUB = 0x64006400;
   const int MUL = 0x2c002c00;
@@ -244,9 +244,9 @@ dequant<nv_bfloat16, vllm::kU4.id()>(int q) {
 
   // Guarantee that the `(a & b) | c` operations are LOP3s.
 
-  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  int lo = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
   q >>= 4;
-  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  int hi = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
 
   typename ScalarType<nv_bfloat16>::FragB frag_b;
   static constexpr uint32_t MUL = 0x3F803F80;
@@ -538,6 +538,7 @@ __global__ void Marlin(
     int prob_n,           // output dimension n
     int prob_k,           // reduction dimension k
     int* locks,           // extra global storage for barrier synchronization
+    bool use_atomic_add,  // whether to use atomic add to reduce
     bool use_fp32_reduce  // whether to use fp32 global reduce
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
@@ -834,6 +835,7 @@ __global__ void Marlin(
   int4* sh_g_idx = sh_b + (stages * b_sh_stage);
   int4* sh_zp = sh_g_idx + (stages * g_idx_stage);
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
+  int4* sh_red = sh_s + (stages * s_sh_stage);
 
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks];
@@ -932,11 +934,11 @@ __global__ void Marlin(
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
           if constexpr (group_blocks >= thread_k_blocks) {
+            if (s_sh_wr_pred) {
+              cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+            }
             // Only fetch scales if this tile starts a new group
-            if (pipe % (group_blocks / thread_k_blocks) == 0) {
-              if (s_sh_wr_pred) {
-                cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
-              }
+            if ((pipe + 1) % (group_blocks / thread_k_blocks) == 0) {
               s_gl_rd += s_gl_rd_delta;
             }
           } else {
@@ -1038,9 +1040,7 @@ __global__ void Marlin(
       // No act-order case
       if constexpr (group_blocks != -1) {
         if constexpr (group_blocks >= thread_k_blocks) {
-          int4* sh_s_stage =
-              sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) *
-                                   (pipe / (group_blocks / thread_k_blocks)));
+          int4* sh_s_stage = sh_s + s_sh_stage * pipe;
           reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
         } else {
           int warp_id = threadIdx.x / 32;
@@ -1339,15 +1339,15 @@ __global__ void Marlin(
               int red_sh_wr =
                   red_sh_delta * j + (red_sh_rd - red_sh_stride * i);
               if (i < red_off) {
-                float* c_rd =
-                    reinterpret_cast<float*>(&sh[red_sh_delta * j + red_sh_rd]);
-                float* c_wr = reinterpret_cast<float*>(&sh[red_sh_wr]);
+                float* c_rd = reinterpret_cast<float*>(
+                    &sh_red[red_sh_delta * j + red_sh_rd]);
+                float* c_wr = reinterpret_cast<float*>(&sh_red[red_sh_wr]);
   #pragma unroll
                 for (int k = 0; k < 4; k++)
                   reinterpret_cast<FragC*>(frag_c)[4 * 2 * m_block + j][k] +=
                       c_rd[k] + c_wr[k];
               }
-              sh[red_sh_wr] =
+              sh_red[red_sh_wr] =
                   reinterpret_cast<int4*>(&frag_c)[4 * 2 * m_block + j];
             }
           }
@@ -1357,7 +1357,7 @@ __global__ void Marlin(
   #pragma unroll
           for (int i = 0; i < 4 * 2; i++) {
             float* c_rd =
-                reinterpret_cast<float*>(&sh[red_sh_delta * i + red_sh_rd]);
+                reinterpret_cast<float*>(&sh_red[red_sh_delta * i + red_sh_rd]);
   #pragma unroll
             for (int j = 0; j < 4; j++)
               reinterpret_cast<FragC*>(frag_c)[4 * 2 * m_block + i][j] +=
@@ -1397,7 +1397,7 @@ __global__ void Marlin(
   #pragma unroll
         for (int i = 0; i < thread_m_blocks * 4; i++) {
           cp_async4_pred(
-              &sh[c_sh_wr + c_sh_wr_delta * i],
+              &sh_red[c_sh_wr + c_sh_wr_delta * i],
               &C[c_gl_wr + c_gl_wr_delta_o * (i / 2) +
                  c_gl_wr_delta_i * (i % 2)],
               i < (thread_m_blocks - 1) * 4 || 8 * (i / 2) + row < prob_m);
@@ -1410,7 +1410,7 @@ __global__ void Marlin(
       for (int i = 0; i < thread_m_blocks * 4; i++) {
         if (i < (thread_m_blocks - 1) * 4 || 8 * (i / 2) + row < prob_m) {
           if (!first) {
-            int4 c_red = sh[c_sh_wr + i * c_sh_wr_delta];
+            int4 c_red = sh_red[c_sh_wr + i * c_sh_wr_delta];
   #pragma unroll
             for (int j = 0; j < 2 * 4; j++) {
               reinterpret_cast<float*>(
@@ -1461,10 +1461,10 @@ __global__ void Marlin(
       float* frag_c_ptr = reinterpret_cast<float*>(&frag_c);
   #pragma unroll
       for (int k = 0; k < th_size; k++) {
-        sh[threadIdx.x] =
+        sh_red[threadIdx.x] =
             C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
 
-        float* sh_c_ptr = reinterpret_cast<float*>(&sh[threadIdx.x]);
+        float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
   #pragma unroll
         for (int f = 0; f < 4; f++) {
           frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
@@ -1515,7 +1515,7 @@ __global__ void Marlin(
         res = __hmul2(res, s[0]);
       }
 
-      ((scalar_t2*)sh)[idx] = res;
+      ((scalar_t2*)sh_red)[idx] = res;
     };
 
     if (threadIdx.x / 32 < thread_n_blocks / 4) {
@@ -1543,7 +1543,17 @@ __global__ void Marlin(
          i < div_ceil(16 * thread_m_blocks, threads / (2 * thread_n_blocks));
          i++) {
       if (c_gl_wr < c_gl_wr_end) {
-        C[c_gl_wr] = sh[c_sh_rd];
+        if (use_atomic_add && slice_count > 1) {
+          scalar_t2* C_half2 = reinterpret_cast<scalar_t2*>(&C[c_gl_wr]);
+          scalar_t2* sh_red_half2 =
+              reinterpret_cast<scalar_t2*>(&sh_red[c_sh_rd]);
+  #pragma unroll
+          for (int a = 0; a < 4; a++) {
+            atomicAdd(&C_half2[a], sh_red_half2[a]);
+          }
+        } else {
+          C[c_gl_wr] = sh_red[c_sh_rd];
+        }
         c_gl_wr += c_gl_wr_delta;
         c_sh_rd += c_sh_rd_delta;
       }
@@ -1645,7 +1655,7 @@ __global__ void Marlin(
           }
           cp_async_fence();
         } else {
-          if (last) {
+          if (last || use_atomic_add) {
             if (s_sh_wr_pred) {
               cp_async4(&sh_s[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
@@ -1665,7 +1675,7 @@ __global__ void Marlin(
           }
 
         } else {
-          if (last) {
+          if (last || use_atomic_add) {
             cp_async_wait<0>();
             __syncthreads();
             if (threadIdx.x / 32 < thread_n_blocks / 4) {
@@ -1704,8 +1714,8 @@ __global__ void Marlin(
         }
       }
 
-      if (slice_count > 1) {  // only globally reduce if there is more than one
-                              // block in a slice
+      if (slice_count > 1 && !use_atomic_add) {
+        // only globally reduce if there is more than one block in a slice
         barrier_acquire(&locks[slice_col], slice_idx);
         if (use_fp32_reduce) {
           global_reduce_fp32(slice_idx == 0, last);
@@ -1714,7 +1724,8 @@ __global__ void Marlin(
         }
         barrier_release(&locks[slice_col], last);
       }
-      if (last)  // only the last block in a slice actually writes the result
+      if (last || use_atomic_add)
+        // only the last block in a slice actuallywrites the result
         write_result();
       slice_row = 0;
       slice_col_par++;
@@ -1769,7 +1780,8 @@ __global__ void Marlin(
                HAS_ZP, GROUP_BLOCKS, IS_ZP_FLOAT>                              \
             <<<blocks, NUM_THREADS, max_shared_mem, stream>>>(                 \
                 A_ptr, B_ptr, C_ptr, C_tmp_ptr, s_ptr, zp_ptr, g_idx_ptr,      \
-                num_groups, prob_m, prob_n, prob_k, locks, use_fp32_reduce);   \
+                num_groups, prob_m, prob_n, prob_k, locks, use_atomic_add,     \
+                use_fp32_reduce);                                              \
       }                                                                        \
     }
 
@@ -1865,9 +1877,12 @@ bool is_valid_cache_size(thread_config_t const& th_config, int max_m_blocks,
 
   float pipe_size = (a_size + b_size) * pipe_stages;
 
+  float reduce_size = max(th_config.num_threads * 32 * 4,
+                          (tb_n / 64) * 32 * (tb_max_m / 16) * 4 * 2 * 4 * 2);
+
   TORCH_CHECK(max_shared_mem / 2 > scales_cache_size);  // Sanity
 
-  return pipe_size < 0.95f * (max_shared_mem - scales_cache_size);
+  return pipe_size + reduce_size < 0.95f * (max_shared_mem - scales_cache_size);
 }
 
 bool is_valid_config(thread_config_t const& th_config, int max_m_blocks,
@@ -2060,7 +2075,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
                vllm::ScalarType const& q_type, bool has_act_order,
                bool is_k_full, bool has_zp, int num_groups, int group_size,
                int dev, cudaStream_t stream, int thread_k, int thread_n,
-               int sms, int max_par, bool use_fp32_reduce, bool is_zp_float) {
+               int sms, int max_par, bool use_atomic_add, bool use_fp32_reduce,
+               bool is_zp_float) {
   if (has_zp) {
     TORCH_CHECK(
         q_type == vllm::kU4 || q_type == vllm::kU8,
@@ -2241,7 +2257,7 @@ torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
                                torch::Tensor& workspace,
                                vllm::ScalarTypeId const& b_q_type_id,
                                int64_t size_m, int64_t size_n, int64_t size_k,
-                               bool is_k_full, bool has_zp,
+                               bool is_k_full, bool has_zp, bool use_atomic_add,
                                bool use_fp32_reduce, bool is_zp_float) {
   vllm::ScalarType const b_q_type = vllm::ScalarType::from_id(b_q_type_id);
   if (has_zp) {
@@ -2304,19 +2320,34 @@ torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
   // Alloc buffers
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   auto options = torch::TensorOptions().dtype(a.dtype()).device(a.device());
-  torch::Tensor c = torch::empty({size_m, size_n}, options);
-  torch::Tensor a_tmp = torch::empty({size_m, size_k}, options);
+  torch::Tensor c;
+  if (use_atomic_add) {
+    c = torch::zeros({size_m, size_n}, options);
+  } else {
+    c = torch::empty({size_m, size_n}, options);
+  }
+
+  torch::Tensor a_tmp;
+  bool has_act_order = g_idx.size(0) != 0;
+  if (has_act_order) {
+    a_tmp = torch::empty({size_m, size_k}, options);
+  } else {
+    a_tmp = torch::empty({0}, options);
+  }
 
   // Alloc C tmp buffer that is going to be used for the global reduce
+  torch::Tensor c_tmp;
   int reduce_max_m = marlin::determine_reduce_max_m(size_m, marlin::max_par);
   int reduce_n = size_n;
   auto options_fp32 =
       torch::TensorOptions().dtype(at::kFloat).device(a.device());
-  if (!use_fp32_reduce) {
+  if (use_fp32_reduce) {
+    c_tmp = torch::empty({reduce_max_m, reduce_n}, options_fp32);
+  } else {
     reduce_max_m = 0;
     reduce_n = 0;
+    c_tmp = torch::empty({0}, options_fp32);
   }
-  torch::Tensor c_tmp = torch::empty({reduce_max_m, reduce_n}, options_fp32);
 
   // thread_k: `k` size of a thread_tile in `weights` (can usually be left as
   // auto -1)
@@ -2337,7 +2368,6 @@ torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
   // Detect groupsize and act_order
   int num_groups = -1;
   int group_size = -1;
-  bool has_act_order = g_idx.size(0) != 0;
 
   int rank = b_scales.sizes().size();
   TORCH_CHECK(rank == 2, "b_scales rank = ", rank, " is not 2");
@@ -2405,7 +2435,8 @@ torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
         a_tmp.data_ptr<at::Half>(), size_m, size_n, size_k,
         workspace.data_ptr(), b_q_type, has_act_order, is_k_full, has_zp,
         num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
-        thread_k, thread_n, sms, marlin::max_par, use_fp32_reduce, is_zp_float);
+        thread_k, thread_n, sms, marlin::max_par, use_atomic_add,
+        use_fp32_reduce, is_zp_float);
   } else if (a.scalar_type() == at::ScalarType::BFloat16) {
     marlin::marlin_mm<nv_bfloat16>(
         a.data_ptr<at::BFloat16>(), b_q_weight.data_ptr(),
@@ -2414,7 +2445,8 @@ torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
         perm.data_ptr(), a_tmp.data_ptr<at::BFloat16>(), size_m, size_n, size_k,
         workspace.data_ptr(), b_q_type, has_act_order, is_k_full, has_zp,
         num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
-        thread_k, thread_n, sms, marlin::max_par, use_fp32_reduce, is_zp_float);
+        thread_k, thread_n, sms, marlin::max_par, use_atomic_add,
+        use_fp32_reduce, is_zp_float);
   } else {
     TORCH_CHECK(false, "gpt_marlin_gemm only supports bfloat16 and float16");
   }
