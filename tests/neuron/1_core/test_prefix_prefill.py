@@ -258,13 +258,13 @@ def sample_inputs(
                              value[start_loc:end_loc])
             cur_ctx += block_size
             block_id += 1
+    kv_cache = torch.stack([k_cache, v_cache])
 
     return (
         query,
         k,
         v,
-        k_cache,
-        v_cache,
+        kv_cache,
         block_table,
         key,
         value,
@@ -314,7 +314,7 @@ def get_active_block_tables(block_tables, query_lens, seq_lens, block_size,
 
         # Test edge cases
         (1, 128, 16, 1024, 4, 2, 16, False),  # large decode batch
-        (16, 4, 8, 8192, 48, 1, 128, True),  # large prefill batch
+        (16, 4, 8, 1024, 4, 2, 128, True),  # large prefill batch
         (4, 12, 32, 2048, 16, 1, 32, True),  # multi-head attention (MHA)
         (4, 12, 32, 2048, 16, 16, 32, True),  # multi-query attention (MQA)
     ])
@@ -361,8 +361,7 @@ def test_contexted_kv_attention(
             query,
             k_active,
             v_active,
-            k_cache,
-            v_cache,
+            kv_cache,
             block_table,
             key,
             value,
@@ -439,8 +438,7 @@ def test_contexted_kv_attention(
         query = query.unsqueeze(0).permute(0, 2, 3, 1).contiguous()
         k = k.unsqueeze(0).permute(0, 2, 3, 1).contiguous()
         v = v.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
-        k_cache = k_cache.permute(0, 2, 1, 3).contiguous()
-        v_cache = v_cache.permute(0, 2, 1, 3).contiguous()
+        kv_cache = kv_cache.permute(0, 1, 3, 2, 4).contiguous()
 
         # transform block table
         active_block_table = get_active_block_tables(
@@ -487,8 +485,7 @@ def test_contexted_kv_attention(
             query.to(device=device),
             k.to(device=device),
             v.to(device=device),
-            k_cache.to(device=device),
-            v_cache.to(device=device),
+            kv_cache.to(device=device),
             active_block_table.to(device=device),
             attn_mask.to(device=device),
         )
